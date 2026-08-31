@@ -1,6 +1,7 @@
 """An abstract class common to all Switchbot entities."""
 
 from collections.abc import Callable, Coroutine, Mapping
+from datetime import datetime, timedelta
 import logging
 from typing import Any, Concatenate, override
 
@@ -19,11 +20,16 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import ToggleEntity
 from homeassistant.helpers.start import async_at_started
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, MANUFACTURER
 from .coordinator import SwitchbotDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+# A failed read is expensive (a connect attempt can block for well over a
+# minute), so back off between retries instead of trying on every advertisement.
+READ_RETRY_INTERVAL = timedelta(minutes=15)
 
 
 class SwitchbotEntity(
@@ -104,11 +110,15 @@ class SwitchbotConnectionPolledEntity(SwitchbotEntity):
 
     Reading needs an active connection, which is slow and frequently
     impossible while Home Assistant is still starting up and competing for the
-    Bluetooth adapter, so the first read is deferred until startup is over.
+    Bluetooth adapter. The first read is therefore deferred until startup has
+    finished, and retried while the device advertises until one succeeds.
     """
 
     _attr_should_poll = True
     _attr_entity_registry_enabled_default = False
+
+    _value_read = False
+    _last_read_attempt: datetime | None = None
 
     async def _async_read_value(self) -> None:
         """Read the value from the device into the entity attributes."""
@@ -123,6 +133,26 @@ class SwitchbotConnectionPolledEntity(SwitchbotEntity):
     @callback
     def _async_hass_started(self, _hass: HomeAssistant) -> None:
         """Read the value now that startup is no longer in the way."""
+        self._async_request_read()
+
+    @callback
+    @override
+    def _handle_coordinator_update(self) -> None:
+        """Handle data update."""
+        super()._handle_coordinator_update()
+        if not self._value_read and self.hass.is_running:
+            self._async_request_read()
+
+    @callback
+    def _async_request_read(self) -> None:
+        """Schedule a read unless one was already attempted recently."""
+        now = dt_util.utcnow()
+        if (
+            self._last_read_attempt is not None
+            and now - self._last_read_attempt < READ_RETRY_INTERVAL
+        ):
+            return
+        self._last_read_attempt = now
         # A background task so a stuck connect is cancelled when the entry
         # unloads instead of holding up shutdown.
         self.coordinator.config_entry.async_create_background_task(
@@ -149,6 +179,7 @@ class SwitchbotConnectionPolledEntity(SwitchbotEntity):
                 exc_info=True,
             )
             return
+        self._value_read = True
 
 
 def exception_handler[_EntityT: SwitchbotEntity, **_P](

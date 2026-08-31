@@ -1,9 +1,11 @@
 """Tests for the switchbot number platform."""
 
 from collections.abc import Callable
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 from bleak_retry_connector import BleakConnectionError
+from freezegun.api import FrozenDateTimeFactory
 import pytest
 
 from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
@@ -12,6 +14,7 @@ from homeassistant.components.number import (
     DOMAIN as NUMBER_DOMAIN,
     SERVICE_SET_VALUE,
 )
+from homeassistant.components.switchbot.entity import READ_RETRY_INTERVAL
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     EVENT_HOMEASSISTANT_STARTED,
@@ -25,6 +28,7 @@ from . import (
     DOMAIN,
     STANDING_FAN_SERVICE_INFO,
     WOMETERTHPC_SERVICE_INFO,
+    WOMETERTHPC_SERVICE_INFO_CHANGED,
     WOMETERTHPC_SERVICE_INFO_NOT_CONNECTABLE,
 )
 
@@ -164,6 +168,44 @@ async def test_meter_pro_co2_display_time_offset_unreachable(
     assert mock_get_time_offset.await_count == expected_await_count
     assert hass.states.get(TIME_OFFSET_ENTITY_ID).state == STATE_UNKNOWN
     assert "Error on device update" not in caplog.text
+
+
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_meter_pro_co2_display_time_offset_retries_after_failed_read(
+    hass: HomeAssistant,
+    mock_entry_factory: Callable[[str], MockConfigEntry],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test a failed read is retried when the device advertises again."""
+    await async_setup_component(hass, DOMAIN, {})
+    inject_bluetooth_service_info(hass, WOMETERTHPC_SERVICE_INFO)
+
+    entry = mock_entry_factory("hygrometer_co2")
+    entry.add_to_hass(hass)
+
+    mock_get_time_offset = AsyncMock(side_effect=BleakConnectionError("unreachable"))
+    with patch("switchbot.SwitchbotMeterProCO2.get_time_offset", mock_get_time_offset):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        assert mock_get_time_offset.await_count == 1
+        assert hass.states.get(TIME_OFFSET_ENTITY_ID).state == STATE_UNKNOWN
+
+        # A fresh advertisement inside the cooldown must not hammer the device.
+        inject_bluetooth_service_info(hass, WOMETERTHPC_SERVICE_INFO_CHANGED)
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert mock_get_time_offset.await_count == 1
+
+        # Once the cooldown has passed the next advertisement retries, and the
+        # device is reachable again.
+        freezer.tick(READ_RETRY_INTERVAL + timedelta(seconds=1))
+        mock_get_time_offset.side_effect = None
+        mock_get_time_offset.return_value = 60
+        inject_bluetooth_service_info(hass, WOMETERTHPC_SERVICE_INFO)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert mock_get_time_offset.await_count == 2
+    assert hass.states.get(TIME_OFFSET_ENTITY_ID).state == "1"
 
 
 @pytest.mark.parametrize(
